@@ -1,0 +1,42 @@
+# Dependencies
+/node_modules
+/.pnp
+.pnp.js
+
+# Testing & Scratch
+/coverage
+/scratch
+*.py
+*.bat
+probe_azbry.py
+test_ai_endpoint.py
+test_connection.py
+check_moodle_methods.py
+
+# Next.js build output
+/.next/
+/out/
+
+# Production
+/build
+
+# Environment variables
+.env*.local
+.env
+
+# Debug & IDE
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+
+# Antigravity artifacts
+.gemini/
+.system_generated/
