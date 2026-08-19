@@ -12,17 +12,23 @@ export function LiveCountdown({ dueDate }: LiveCountdownProps) {
   const [countdown, setCountdown] = useState(() => formatCountdown(dueDate));
 
   useEffect(() => {
-    // Update every 30 seconds
+    setCountdown(formatCountdown(dueDate));
+
+    // Update every 10 seconds for real-time responsiveness
     const interval = setInterval(() => {
       setCountdown(formatCountdown(dueDate));
-    }, 30000);
+    }, 10000);
 
     return () => clearInterval(interval);
   }, [dueDate]);
 
+  let icon = '⏳ ';
+  if (countdown.isOverdue) icon = '⚠️ ';
+  else if (!dueDate) icon = '🕒 ';
+
   return (
     <NeoBadge variant={countdown.priority}>
-      {countdown.isOverdue ? '⚠️ ' : '⏳ '}
+      {icon}
       {countdown.text}
     </NeoBadge>
   );

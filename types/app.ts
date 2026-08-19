@@ -37,6 +37,8 @@ export interface Assignment {
   description: string;
   url: string;
   dueDate: string | null; // ISO string
+  cutoffDate?: string | null; // ISO string
+  allowSubmissionsFromDate?: string | null; // ISO string
   status: AssignmentStatus;
   submittedAt: string | null;
   gradedAt: string | null;

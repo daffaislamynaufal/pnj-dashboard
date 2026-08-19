@@ -1,6 +1,6 @@
 import { Course, Assignment, Quiz, CalendarEvent, Announcement, GradeItem } from '@/types/app';
 import { MOODLE_BASE_URL } from './config';
-import { parseIndonesianDateStringToISO } from './parser';
+import { calculatePriority } from '../utils/priority';
 
 export class MoodleNormalizer {
   /**
@@ -11,7 +11,6 @@ export class MoodleNormalizer {
     const fullName = String(raw.fullname || raw.name || `Mata Kuliah #${sourceId}`).trim();
     const shortName = String(raw.shortname || raw.shortName || `PNJ-${sourceId}`).trim();
     
-    // Extract course code if present inside bracket or prefix
     const codeMatch = fullName.match(/^\[?([A-Z0-9_-]+)\]?\s*[:-]?\s*(.*)/i);
     const courseCode = codeMatch ? codeMatch[1] : shortName;
     const cleanName = codeMatch && codeMatch[2] ? codeMatch[2].trim() : fullName;
@@ -37,11 +36,31 @@ export class MoodleNormalizer {
   }
 
   /**
-   * Normalize raw Moodle Assignment data with comprehensive deadline parsing
+   * Centralized normalizeAssignment function
+   * Strictly extracts Moodle Unix timestamps: new Date(duedate * 1000)
    */
   static normalizeAssignment(raw: any, courseNameMap: Map<string, string> = new Map()): Assignment {
-    // Determine consistent sourceId
-    const sourceId = String(raw.instance || raw.id || raw.sourceId || '');
+    // Temporary debug logging in development mode
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[MOODLE ASSIGNMENT RAW]', {
+        id: raw.id,
+        cmid: raw.cmid,
+        name: raw.name || raw.title,
+        duedate: raw.duedate,
+        cutoffdate: raw.cutoffdate,
+        allowsubmissionsfromdate: raw.allowsubmissionsfromdate,
+        timesort: raw.timesort,
+        timestart: raw.timestart,
+      });
+      console.log('[MOODLE DUE DATE]', {
+        id: raw.id,
+        name: raw.name || raw.title,
+        duedate: raw.duedate,
+        cutoffdate: raw.cutoffdate,
+      });
+    }
+
+    const sourceId = String(raw.cmid || raw.id || raw.instance || raw.sourceId || '');
     
     // Safely extract courseId whether course is an object or primitive
     let courseId = '0';
@@ -66,33 +85,40 @@ export class MoodleNormalizer {
     } else {
       courseName = courseId !== '0' ? `Mata Kuliah #${courseId}` : 'E-Learning PNJ';
     }
-
-    // Clean course name if contains course codes
     courseName = courseName.replace(/^[A-Z0-9_-]+\s*[:-]\s*/i, '');
-    
-    // Extract timestamp from all possible Moodle fields (timesort, timestart, duedate, formattedtime)
-    let dueDate: string | null = null;
-    const rawTimestamp = raw.timesort || raw.timestart || raw.duedate || raw.time;
-    
-    if (typeof rawTimestamp === 'number' && rawTimestamp > 0) {
-      dueDate = new Date(rawTimestamp * 1000).toISOString();
-    } else if (typeof rawTimestamp === 'string') {
-      const parsed = parseIndonesianDateStringToISO(rawTimestamp);
-      if (parsed) dueDate = parsed;
+
+    // Extract raw Unix timestamp (in seconds)
+    let dueTimestamp = 0;
+    if (typeof raw.duedate === 'number') {
+      dueTimestamp = raw.duedate;
+    } else if (raw.duedate) {
+      dueTimestamp = Number(raw.duedate) || 0;
+    } else if (typeof raw.timesort === 'number') {
+      dueTimestamp = raw.timesort;
+    } else if (typeof raw.timestart === 'number') {
+      dueTimestamp = raw.timestart;
     }
 
-    // If still null, check formattedtime (e.g. "<b>Jatuh tempo:</b> Senin, 24 Agustus 2026, 23:59")
-    if (!dueDate && raw.formattedtime) {
-      const cleanTime = String(raw.formattedtime).replace(/<[^>]*>?/gm, ' ').trim();
-      const parsed = parseIndonesianDateStringToISO(cleanTime);
-      if (parsed) dueDate = parsed;
+    let cutoffTimestamp = 0;
+    if (typeof raw.cutoffdate === 'number') {
+      cutoffTimestamp = raw.cutoffdate;
+    } else if (raw.cutoffdate) {
+      cutoffTimestamp = Number(raw.cutoffdate) || 0;
     }
 
-    if (!dueDate && raw.dueDate) {
-      dueDate = raw.dueDate;
+    let allowSubmissionsTimestamp = 0;
+    if (typeof raw.allowsubmissionsfromdate === 'number') {
+      allowSubmissionsTimestamp = raw.allowsubmissionsfromdate;
+    } else if (raw.allowsubmissionsfromdate) {
+      allowSubmissionsTimestamp = Number(raw.allowsubmissionsfromdate) || 0;
     }
 
-    // Clean up title (remove trailing "is due", "Assignment", "berakhir", etc.)
+    // Conversion: duedate > 0 -> new Date(duedate * 1000).toISOString()
+    const dueDate = dueTimestamp > 0 ? new Date(dueTimestamp * 1000).toISOString() : null;
+    const cutoffDate = cutoffTimestamp > 0 ? new Date(cutoffTimestamp * 1000).toISOString() : null;
+    const allowSubmissionsFromDate = allowSubmissionsTimestamp > 0 ? new Date(allowSubmissionsTimestamp * 1000).toISOString() : null;
+
+    // Clean up title
     let title = String(raw.name || raw.title || 'Tugas').trim();
     title = title
       .replace(/\s+(is due|is closing|berakhir|jatuh tempo|Assignment)$/i, '')
@@ -108,7 +134,6 @@ export class MoodleNormalizer {
       status = 'overdue';
     }
 
-    // Extract real URL
     let url = raw.url || raw.action?.url || '';
     if (!url || typeof url !== 'string' || !url.startsWith('http')) {
       url = `${MOODLE_BASE_URL}/mod/assign/view.php?id=${sourceId}`;
@@ -123,12 +148,14 @@ export class MoodleNormalizer {
       description: String(raw.intro || raw.description || '').replace(/<[^>]*>?/gm, '').trim(),
       url,
       dueDate,
+      cutoffDate,
+      allowSubmissionsFromDate,
       status,
       submittedAt: raw.submittedAt || null,
       gradedAt: raw.gradedAt || null,
       grade: raw.grade !== undefined ? raw.grade : null,
       maxGrade: raw.maxGrade || raw.gradeitem?.grademax || 100,
-      priority: 'upcoming',
+      priority: calculatePriority(dueDate),
       lastUpdated: new Date().toISOString(),
       syncedAt: new Date().toISOString(),
     };

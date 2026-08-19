@@ -65,7 +65,7 @@ export class MoodleClient {
   }
 
   /**
-   * Helper to execute Level 1 Web Service REST API
+   * Helper to execute Level 1 Web Service REST API with proper indexed array params
    */
   private async executeWs<T = any>(wsfunction: string, params: Record<string, any> = {}): Promise<T> {
     if (!this.session.wstoken) {
@@ -76,7 +76,17 @@ export class MoodleClient {
       wstoken: this.session.wstoken,
       wsfunction,
       moodlewsrestformat: 'json',
-      ...params,
+    });
+
+    // Expand array parameters into indexed query format: courseids[0]=123&courseids[1]=456
+    Object.entries(params).forEach(([key, val]) => {
+      if (Array.isArray(val)) {
+        val.forEach((item, idx) => {
+          query.append(`${key}[${idx}]`, String(item));
+        });
+      } else if (val !== undefined && val !== null) {
+        query.append(key, String(val));
+      }
     });
 
     const res = await fetch(`${MOODLE_CONFIG.webServiceUrl}?${query.toString()}`, {
@@ -109,9 +119,7 @@ export class MoodleClient {
           const courses = data.map(c => MoodleNormalizer.normalizeCourse(c));
           return { courses, tier: 'level1_rest' };
         }
-      } catch {
-        // Fallthrough
-      }
+      } catch {}
     }
 
     // Level 2: Direct AJAX timeline classification
@@ -129,9 +137,7 @@ export class MoodleClient {
           const courses = rawCourses.map((c: any) => MoodleNormalizer.normalizeCourse(c));
           return { courses, tier: 'level2_ajax' };
         }
-      } catch {
-        // Fallthrough
-      }
+      } catch {}
     }
 
     // Fallback: Fetch /my/courses.php HTML
@@ -141,17 +147,59 @@ export class MoodleClient {
   }
 
   /**
-   * Fetch Assignments DIRECTLY via Moodle API (core_course_get_contents & calendar events)
+   * Fetch Assignments DIRECTLY via Moodle API (mod_assign_get_assignments, core_course_get_contents, action_events)
    */
   async getAssignments(courses: Course[]): Promise<{ assignments: Assignment[]; tier: string }> {
     const courseMap = new Map<string, string>(courses.map(c => [String(c.sourceId), c.name]));
     const assignmentsMap = new Map<string, Assignment>();
     let detectedTier = 'level2_ajax';
 
-    // 1. Direct API Method A: Call core_calendar_get_action_events_by_timesort
-    if (this.session.sesskey) {
+    const courseIds = courses.map(c => Number(c.sourceId)).filter(id => !isNaN(id) && id > 0);
+
+    // 1. PRIMARY API: mod_assign_get_assignments via Web Services (if wstoken)
+    if (this.session.wstoken && courseIds.length > 0) {
+      try {
+        const data = await this.executeWs<any>('mod_assign_get_assignments', { courseids: courseIds });
+        if (data?.courses && Array.isArray(data.courses)) {
+          data.courses.forEach((c: any) => {
+            (c.assignments || []).forEach((a: any) => {
+              const norm = MoodleNormalizer.normalizeAssignment({ ...a, course: c.id }, courseMap);
+              assignmentsMap.set(norm.id, norm);
+            });
+          });
+          if (assignmentsMap.size > 0) {
+            return { assignments: Array.from(assignmentsMap.values()), tier: 'level1_rest' };
+          }
+        }
+      } catch {}
+    }
+
+    // 2. PRIMARY AJAX: mod_assign_get_assignments via AJAX service
+    if (this.session.sesskey && courseIds.length > 0) {
       try {
         const ajaxRes = await this.executeAjax<any>([
+          {
+            index: 0,
+            methodname: 'mod_assign_get_assignments',
+            args: { courseids: courseIds },
+          },
+        ]);
+
+        if (ajaxRes[0] && !ajaxRes[0].error && ajaxRes[0].data?.courses) {
+          ajaxRes[0].data.courses.forEach((c: any) => {
+            (c.assignments || []).forEach((a: any) => {
+              const norm = MoodleNormalizer.normalizeAssignment({ ...a, course: c.id }, courseMap);
+              assignmentsMap.set(norm.id, norm);
+            });
+          });
+        }
+      } catch {}
+    }
+
+    // 3. SECONDARY AJAX: core_calendar_get_action_events_by_timesort
+    if (this.session.sesskey) {
+      try {
+        const calRes = await this.executeAjax<any>([
           {
             index: 0,
             methodname: 'core_calendar_get_action_events_by_timesort',
@@ -163,24 +211,27 @@ export class MoodleClient {
           },
         ]);
 
-        if (ajaxRes[0] && !ajaxRes[0].error && ajaxRes[0].data?.events) {
-          const events = ajaxRes[0].data.events;
-          for (const ev of events) {
+        if (calRes[0] && !calRes[0].error && calRes[0].data?.events) {
+          calRes[0].data.events.forEach((ev: any) => {
             if (ev.modulename === 'assign' || ev.eventtype === 'due' || ev.purpose === 'assessment') {
-              const normalized = MoodleNormalizer.normalizeAssignment(ev, courseMap);
-              assignmentsMap.set(normalized.id, normalized);
+              const norm = MoodleNormalizer.normalizeAssignment(ev, courseMap);
+              const existing = assignmentsMap.get(norm.id);
+              if (existing) {
+                if (!existing.dueDate && norm.dueDate) {
+                  existing.dueDate = norm.dueDate;
+                }
+              } else {
+                assignmentsMap.set(norm.id, norm);
+              }
             }
-          }
+          });
         }
-      } catch {
-        // Continue to course contents API
-      }
+      } catch {}
     }
 
-    // 2. Direct API Method B: Call core_course_get_contents for every enrolled course
+    // 4. TERTIARY AJAX: core_course_get_contents for all enrolled courses
     if (this.session.sesskey && courses.length > 0) {
       try {
-        // Batch request course contents for all courses via single AJAX payload
         const batchRequests: MoodleAjaxRequest[] = courses.slice(0, 15).map((course, idx) => ({
           index: idx,
           methodname: 'core_course_get_contents',
@@ -199,25 +250,16 @@ export class MoodleClient {
                   const assignKey = `assign_${modId}`;
 
                   let parsedDueDate: string | null = null;
+                  let rawDueTimestamp: number | null = null;
 
-                  // Extract deadline from module dates array
                   if (Array.isArray(mod.dates)) {
                     for (const d of mod.dates) {
                       if (d.timestamp && typeof d.timestamp === 'number' && d.timestamp > 0) {
+                        rawDueTimestamp = d.timestamp;
                         parsedDueDate = new Date(d.timestamp * 1000).toISOString();
                         break;
                       }
                     }
-                  }
-
-                  // Extract deadline from customdata if present
-                  if (!parsedDueDate && mod.customdata) {
-                    try {
-                      const cd = typeof mod.customdata === 'string' ? JSON.parse(mod.customdata) : mod.customdata;
-                      if (cd?.duedate) {
-                        parsedDueDate = new Date(Number(cd.duedate) * 1000).toISOString();
-                      }
-                    } catch {}
                   }
 
                   const existing = assignmentsMap.get(assignKey);
@@ -230,10 +272,10 @@ export class MoodleClient {
                       {
                         id: modId,
                         instance: mod.instance,
+                        cmid: mod.id,
                         name: mod.name,
                         course: { id: course.sourceId, fullname: course.name },
-                        duedate: parsedDueDate ? Date.parse(parsedDueDate) / 1000 : null,
-                        dueDate: parsedDueDate,
+                        duedate: rawDueTimestamp,
                         url: mod.url || `${MOODLE_CONFIG.baseUrl}/mod/assign/view.php?id=${modId}`,
                       },
                       courseMap
@@ -245,14 +287,47 @@ export class MoodleClient {
             });
           }
         });
-      } catch {
-        // Fallthrough
-      }
+      } catch {}
+    }
+
+    // 5. USER OVERRIDES / SUBMISSION STATUS CHECK: mod_assign_get_submission_status
+    if (this.session.sesskey && assignmentsMap.size > 0) {
+      try {
+        const assignList = Array.from(assignmentsMap.values());
+        const statusRequests: MoodleAjaxRequest[] = assignList.slice(0, 15).map((a, idx) => ({
+          index: idx,
+          methodname: 'mod_assign_get_submission_status',
+          args: { assignid: Number(a.sourceId) },
+        }));
+
+        const statusRes = await this.executeAjax<any>(statusRequests);
+
+        statusRes.forEach((res, idx) => {
+          if (!res.error && res.data) {
+            const assign = assignList[idx];
+            const data: any = res.data;
+
+            // Extract student-specific duedate override if present
+            if (data.gradingsummary?.duedate && data.gradingsummary.duedate > 0) {
+              assign.dueDate = new Date(data.gradingsummary.duedate * 1000).toISOString();
+            }
+            if (data.gradingsummary?.cutoffdate && data.gradingsummary.cutoffdate > 0) {
+              assign.cutoffDate = new Date(data.gradingsummary.cutoffdate * 1000).toISOString();
+            }
+
+            // Extract submission status
+            const subStatus = data.lastattempt?.submission?.status;
+            if (subStatus === 'submitted') {
+              assign.status = 'submitted';
+            }
+          }
+        });
+      } catch {}
     }
 
     const assignments = Array.from(assignmentsMap.values());
 
-    // 3. Fallback: If still empty, fetch HTML course pages
+    // 6. CONTROLLED HTML FALLBACK: Only if API returned zero assignments or missing duedate
     if (assignments.length === 0) {
       for (const course of courses.slice(0, 8)) {
         try {
@@ -262,14 +337,12 @@ export class MoodleClient {
             a.courseName = course.name;
             assignments.push(a);
           });
-        } catch {
-          // Continue
-        }
+        } catch {}
       }
       detectedTier = 'level4_html';
     }
 
-    // 4. If any assignment still has no deadline, deep fetch the view.php page
+    // Deep check view.php for assignments with null dueDate
     for (const assign of assignments) {
       if (!assign.dueDate && assign.url) {
         try {
@@ -277,22 +350,12 @@ export class MoodleClient {
           const $ = cheerio.load(assignHtml);
 
           let foundDateText = '';
-          // Search in activity dates and tables
-          $('[data-region="activity-dates"], .activity-dates, .submissionstatustable, .generaltable').each((_, el) => {
+          $('[data-region="activity-dates"], .activity-dates, .submissionstatustable, .generaltable tr').each((_, el) => {
             const text = $(el).text();
             if (text.includes('Jatuh tempo') || text.includes('Batas waktu') || text.includes('Due') || text.includes('Tenggat')) {
               foundDateText = text;
             }
           });
-
-          if (!foundDateText) {
-            $('tr').each((_, tr) => {
-              const rowText = $(tr).text();
-              if (rowText.includes('Jatuh tempo') || rowText.includes('Batas waktu') || rowText.includes('Due date')) {
-                foundDateText = $(tr).find('td').last().text().trim();
-              }
-            });
-          }
 
           if (foundDateText) {
             const parsedIso = parseIndonesianDateStringToISO(foundDateText);
@@ -308,7 +371,7 @@ export class MoodleClient {
   }
 
   /**
-   * Fetch Calendar events via direct API
+   * Fetch Calendar events
    */
   async getCalendarEvents(): Promise<{ events: CalendarEvent[]; tier: string }> {
     if (this.session.sesskey) {
@@ -332,9 +395,7 @@ export class MoodleClient {
           const events = rawEvents.map(e => MoodleNormalizer.normalizeCalendarEvent(e));
           return { events, tier: 'level2_ajax' };
         }
-      } catch {
-        // Fallthrough
-      }
+      } catch {}
     }
 
     return { events: [], tier: 'level4_html' };
